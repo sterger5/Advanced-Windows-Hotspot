@@ -1,8 +1,8 @@
 ; Advanced Windows Hotspot - Inno Setup 安装脚本
-; 版本: 1.0.0
+; 版本: 1.1.0
 
 #define MyAppName "Advanced Windows Hotspot"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "sterger5"
 #define MyAppURL "https://github.com/sterger5/Advanced-Windows-Hotspot"
 #define MyAppExeName "AdvancedWindowsHotspot.exe"
@@ -23,7 +23,7 @@ DefaultGroupName={#MyAppName}
 ; 输出设置
 OutputDir=publish
 OutputBaseFilename=AdvancedWindowsHotspot_Setup_v{#MyAppVersion}
-SetupIconFile=
+SetupIconFile=app.ico
 Compression=lzma2/ultra64
 SolidCompression=yes
 
@@ -51,8 +51,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "publish\output\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "publish\output\*.pdb"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "publish\v1.1.0\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
