@@ -604,6 +604,27 @@ namespace AdvancedWindowsHotspot.Services
                 {
                     DisableInternetSharing();
                 }
+                else
+                {
+                    // 对于以太网上行网卡，系统热点可能不会自动配置ICS
+                    // 尝试查找热点适配器，如果找到则显式配置ICS以确保共享正常工作
+                    try
+                    {
+                        var internetAdapterName = GetInternetAdapterName();
+                        var hotspotName = FindWiFiDirectVirtualAdapter();
+                        if (internetAdapterName != null && hotspotName != null &&
+                            !string.Equals(internetAdapterName, hotspotName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Logger.Info($"TetheringManager模式：尝试显式配置ICS ({internetAdapterName} → {hotspotName})");
+                            var icsResult = ConfigureIcs(internetAdapterName, hotspotName);
+                            Logger.Info($"TetheringManager ICS显式配置结果: {icsResult}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warning($"TetheringManager ICS显式配置失败（不影响热点运行）: {ex.Message}");
+                    }
+                }
 
                 HotspotStarted?.Invoke(this, EventArgs.Empty);
             }
@@ -699,18 +720,40 @@ namespace AdvancedWindowsHotspot.Services
         #region Internet连接共享 (ICS)
 
         /// <summary>
-        /// 手动启用Internet连接共享（供UI按钮调用）
+        /// 手动启用Internet连接共享（供UI按钮调用，自动检测上行适配器）
         /// 返回 (是否成功, 结果消息)
         /// </summary>
         public (bool success, string message) ManualEnableInternetSharing()
         {
+            return ManualEnableInternetSharing(null);
+        }
+
+        /// <summary>
+        /// 手动启用Internet连接共享（供UI按钮调用，可指定上行适配器）
+        /// 返回 (是否成功, 结果消息)
+        /// </summary>
+        /// <param name="internetAdapterName">指定的互联网适配器名称，为null时自动检测</param>
+        public (bool success, string message) ManualEnableInternetSharing(string? internetAdapterName)
+        {
             try
             {
-                var (internetAdapterName, hotspotAdapterName) = FindIcsAdapters(retry: false);
+                // 先禁用所有现有ICS配置，避免冲突
+                Logger.Info("手动启用ICS前先清理现有共享配置");
+                DisableInternetSharing();
+                System.Threading.Thread.Sleep(1000);
+
+                var (_, hotspotAdapterName) = FindIcsAdapters(retry: true);
                 if (hotspotAdapterName == null)
                 {
-                    return (false, "未找到热点虚拟适配器（Wi-Fi Direct Virtual Adapter），请确保热点已启动且有设备连接");
+                    return (false, "未找到热点虚拟适配器，请确保热点已启动");
                 }
+
+                // 如果未指定上行适配器，自动检测
+                if (string.IsNullOrWhiteSpace(internetAdapterName))
+                {
+                    internetAdapterName = GetInternetAdapterName();
+                }
+
                 if (internetAdapterName == null)
                 {
                     return (false, "未找到互联网适配器，请确保本机已连接互联网");
@@ -744,6 +787,10 @@ namespace AdvancedWindowsHotspot.Services
             try
             {
                 Logger.Info("正在为WiFiDirect配置Internet连接共享...");
+
+                // 先禁用所有现有ICS配置，确保干净的环境
+                DisableInternetSharing();
+                System.Threading.Thread.Sleep(1000);
 
                 var (internetAdapterName, hotspotAdapterName) = FindIcsAdapters(retry: true);
 
@@ -858,13 +905,13 @@ namespace AdvancedWindowsHotspot.Services
         }
 
         /// <summary>
-        /// 查找WiFiDirect虚拟适配器名称（更可靠的识别方式）
+        /// 查找热点虚拟适配器名称（支持WiFiDirect和系统热点两种模式）
         /// </summary>
         private string? FindWiFiDirectVirtualAdapter()
         {
             try
             {
-                // 方法1：查找描述包含"Wi-Fi Direct"的适配器
+                // 方法1：查找描述包含"Wi-Fi Direct"的适配器（WiFiDirect模式）
                 var output = RunProcessWithOutput("powershell",
                     "-Command \"(Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Wi-Fi Direct*' -or $_.InterfaceDescription -like '*Microsoft Wi-Fi Direct*' -or $_.InterfaceDescription -like '*Microsoft Wi-Fi Direct Virtual*'} | Select-Object -First 1).Name\"");
                 if (!string.IsNullOrWhiteSpace(output?.Trim()))
@@ -872,7 +919,7 @@ namespace AdvancedWindowsHotspot.Services
                     return output.Trim();
                 }
 
-                // 方法2：查找状态为Up的"Local Area Connection*"适配器
+                // 方法2：查找状态为Up的"Local Area Connection*"适配器（系统热点模式）
                 output = RunProcessWithOutput("powershell",
                     "-Command \"(Get-NetAdapter | Where-Object {$_.Name -like 'Local Area Connection*' -and $_.Status -eq 'Up'} | Select-Object -First 1).Name\"");
                 if (!string.IsNullOrWhiteSpace(output?.Trim()))
@@ -882,15 +929,31 @@ namespace AdvancedWindowsHotspot.Services
 
                 // 方法3：查找所有虚拟适配器中最新启用的
                 output = RunProcessWithOutput("powershell",
-                    "-Command \"(Get-NetAdapter | Where-Object {($_.InterfaceDescription -like '*Virtual*' -or $_.InterfaceDescription -like '*Hosted*') -and $_.Status -eq 'Up'} | Sort-Object -Property MediaConnectionState -Descending | Select-Object -First 1).Name\"");
+                    "-Command \"(Get-NetAdapter | Where-Object {($_.InterfaceDescription -like '*Virtual*' -or $_.InterfaceDescription -like '*Hosted*' -or $_.InterfaceDescription -like '*Microsoft*Hosted*') -and $_.Status -eq 'Up'} | Sort-Object -Property MediaConnectionState -Descending | Select-Object -First 1).Name\"");
                 if (!string.IsNullOrWhiteSpace(output?.Trim()))
                 {
                     return output.Trim();
                 }
+
+                // 方法4：查找"以太网"或"Ethernet"名称中包含数字的适配器（系统热点可能创建的虚拟适配器）
+                output = RunProcessWithOutput("powershell",
+                    "-Command \"(Get-NetAdapter | Where-Object {($_.Name -like '*以太网*' -or $_.Name -like '*Ethernet*') -and $_.Name -match '\\d+$' -and $_.Status -eq 'Up'} | Select-Object -First 1).Name\"");
+                if (!string.IsNullOrWhiteSpace(output?.Trim()))
+                {
+                    return output.Trim();
+                }
+
+                // 方法5：列出所有状态为Up的适配器用于日志
+                var allUp = RunProcessWithOutput("powershell",
+                    "-Command \"(Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object Name, InterfaceDescription | Format-Table -AutoSize | Out-String -Width 4096)\"");
+                if (!string.IsNullOrWhiteSpace(allUp?.Trim()))
+                {
+                    Logger.Info($"所有状态为Up的适配器:\n{allUp.Trim()}");
+                }
             }
             catch (Exception ex)
             {
-                Logger.Warning($"查找WiFiDirect虚拟适配器失败: {ex.Message}");
+                Logger.Warning($"查找热点虚拟适配器失败: {ex.Message}");
             }
             return null;
         }
@@ -996,27 +1059,26 @@ namespace AdvancedWindowsHotspot.Services
             sb.AppendLine("        exit 1");
             sb.AppendLine("    }");
             sb.AppendLine();
+            sb.AppendLine("    # === 第一步：禁用所有连接上的现有ICS配置 ===");
+            sb.AppendLine("    Write-Output 'INFO: 开始清理所有现有ICS配置...'");
+            sb.AppendLine("    foreach ($c in $cons) {");
+            sb.AppendLine("        try {");
+            sb.AppendLine("            $cfg = $sMan.get_NetSharingConfigurationForINetConnection($c)");
+            sb.AppendLine("            if ($cfg.SharingEnabled) {");
+            sb.AppendLine("                $props = $sMan.NetConnectionProps($c)");
+            sb.AppendLine("                Write-Output \"INFO: 禁用现有共享: $($props.Name) (Type=$($cfg.SharingConnectionType))\"");
+            sb.AppendLine("                $cfg.DisableSharing()");
+            sb.AppendLine("                Start-Sleep -Milliseconds 500");
+            sb.AppendLine("            }");
+            sb.AppendLine("        } catch { }");
+            sb.AppendLine("    }");
+            sb.AppendLine("    Start-Sleep -Seconds 1");
+            sb.AppendLine();
             sb.AppendLine($"    $pubConn = $map['{safePublic}']");
             sb.AppendLine($"    $priConn = $map['{safePrivate}']");
             sb.AppendLine();
             sb.AppendLine($"    Write-Output 'INFO: 上行连接: {safePublic}'");
             sb.AppendLine($"    Write-Output 'INFO: 下行连接: {safePrivate}'");
-            sb.AppendLine();
-            sb.AppendLine("    # 取共享配置（使用get_显式方法名）");
-            sb.AppendLine("    $pubCfg = $sMan.get_NetSharingConfigurationForINetConnection($pubConn)");
-            sb.AppendLine("    $priCfg = $sMan.get_NetSharingConfigurationForINetConnection($priConn)");
-            sb.AppendLine();
-            sb.AppendLine("    # 检查是否已经正确配置");
-            sb.AppendLine("    if ($pubCfg.SharingEnabled -and $pubCfg.SharingConnectionType -eq 0 -and");
-            sb.AppendLine("        $priCfg.SharingEnabled -and $priCfg.SharingConnectionType -eq 1) {");
-            sb.AppendLine("        Write-Output 'INFO: ICS已正确配置，无需修改'");
-            sb.AppendLine("        Write-Output 'SUCCESS: ICS配置完成'");
-            sb.AppendLine("        exit 0");
-            sb.AppendLine("    }");
-            sb.AppendLine();
-            sb.AppendLine("    # 先关旧共享，防止\"已共享给别的接口\"冲突");
-            sb.AppendLine("    try { $pubCfg.DisableSharing() } catch { }");
-            sb.AppendLine("    Start-Sleep -Milliseconds 800");
             sb.AppendLine();
             sb.AppendLine("    # 开启：上行=Internet(public)，下行=private");
             sb.AppendLine("    # EnableSharing 参数: 0 = PUBLIC (共享来源), 1 = PRIVATE (家庭网络连接)");
@@ -1056,7 +1118,7 @@ namespace AdvancedWindowsHotspot.Services
 
         /// <summary>
         /// 通过C# COM对象配置ICS（作为PowerShell方式的备选）
-        /// 顺序：先禁用公共连接旧共享 → 启用公共(0) → 启用私有(1)
+        /// 先禁用所有现有共享，再启用公共(0) + 私有(1)
         /// </summary>
         private bool ConfigureIcsViaCom(string? internetAdapterName, string? hotspotAdapterName)
         {
@@ -1081,9 +1143,11 @@ namespace AdvancedWindowsHotspot.Services
                     // 枚举所有连接，建立名称映射
                     var connections = manager.EnumEveryConnection;
                     var nameMap = new Dictionary<string, object>();
+                    var allConnections = new List<object>();
 
                     foreach (var conn in connections)
                     {
+                        allConnections.Add(conn);
                         try
                         {
                             dynamic props = manager.NetConnectionProps[conn];
@@ -1096,6 +1160,28 @@ namespace AdvancedWindowsHotspot.Services
                             Logger.Debug($"处理连接时出错: {ex.Message}");
                         }
                     }
+
+                    // 第一步：禁用所有现有ICS配置
+                    Logger.Info("C# COM: 禁用所有现有ICS配置...");
+                    foreach (var conn in allConnections)
+                    {
+                        try
+                        {
+                            dynamic cfg = manager.INetSharingConfigurationForINetConnection[conn];
+                            if (cfg.SharingEnabled)
+                            {
+                                dynamic props = manager.NetConnectionProps[conn];
+                                Logger.Info($"禁用现有共享: {props.Name} (Type={cfg.SharingConnectionType})");
+                                cfg.DisableSharing();
+                                System.Threading.Thread.Sleep(300);
+                            }
+                        }
+                        catch
+                        {
+                            // 忽略单个连接禁用失败
+                        }
+                    }
+                    System.Threading.Thread.Sleep(1000);
 
                     if (!nameMap.TryGetValue(internetAdapterName!, out var publicConnection))
                     {
@@ -1112,31 +1198,13 @@ namespace AdvancedWindowsHotspot.Services
                     Logger.Info($"上行连接: {internetAdapterName}");
                     Logger.Info($"下行连接: {hotspotAdapterName}");
 
-                    // 取共享配置
-                    dynamic pubConfig = manager.INetSharingConfigurationForINetConnection[publicConnection];
-                    dynamic privConfig = manager.INetSharingConfigurationForINetConnection[privateConnection];
-
-                    // 检查是否已经正确配置
-                    if (pubConfig.SharingEnabled && pubConfig.SharingConnectionType == 0 &&
-                        privConfig.SharingEnabled && privConfig.SharingConnectionType == 1)
-                    {
-                        Logger.Info("ICS已正确配置，无需修改");
-                        return true;
-                    }
-
-                    // 先关旧共享，防止"已共享给别的接口"冲突
-                    try { pubConfig.DisableSharing(); } catch { }
-                    System.Threading.Thread.Sleep(800);
-
-                    // 重新获取配置（禁用后可能需要重新获取）
-                    pubConfig = manager.INetSharingConfigurationForINetConnection[publicConnection];
-                    privConfig = manager.INetSharingConfigurationForINetConnection[privateConnection];
-
                     // 启用公共连接共享（0 = PUBLIC，共享来源）
+                    dynamic pubConfig = manager.INetSharingConfigurationForINetConnection[publicConnection];
                     pubConfig.EnableSharing(0);
                     Logger.Info("已启用公共连接共享（上行）");
 
                     // 启用私有连接共享（1 = PRIVATE，家庭网络连接）
+                    dynamic privConfig = manager.INetSharingConfigurationForINetConnection[privateConnection];
                     privConfig.EnableSharing(1);
                     Logger.Info("已启用私有连接共享（下行）");
 
@@ -1236,59 +1304,197 @@ namespace AdvancedWindowsHotspot.Services
         }
 
         /// <summary>
+        /// 获取所有可用的互联网适配器列表（供用户选择）
+        /// 返回 (适配器名称, 适配器描述) 的列表
+        /// </summary>
+        public List<(string name, string description)> GetAvailableInternetAdapters()
+        {
+            var result = new List<(string name, string description)>();
+
+            try
+            {
+                // 查找所有状态为Up的物理适配器，且有IPv4默认网关
+                var output = RunProcessWithOutput("powershell",
+                    "-Command \"" +
+                    "Get-NetAdapter -Physical -ErrorAction SilentlyContinue | " +
+                    "  Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*Wi-Fi Direct*'} | " +
+                    "  ForEach-Object { " +
+                    "    $cfg = $_ | Get-NetIPConfiguration -ErrorAction SilentlyContinue; " +
+                    "    if ($cfg -and $cfg.IPv4DefaultGateway) { " +
+                    "      Write-Output \\\"$($_.Name)|$($_.InterfaceDescription)\\\" " +
+                    "    } " +
+                    "  }\"", 15000);
+
+                if (!string.IsNullOrWhiteSpace(output))
+                {
+                    foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var trimmed = line.Trim();
+                        if (string.IsNullOrEmpty(trimmed)) continue;
+
+                        var parts = trimmed.Split('|', 2);
+                        if (parts.Length >= 1 && !string.IsNullOrWhiteSpace(parts[0]))
+                        {
+                            var name = parts[0].Trim();
+                            var desc = parts.Length >= 2 ? parts[1].Trim() : name;
+                            result.Add((name, desc));
+                        }
+                    }
+                }
+
+                // 如果上面的方式没有结果，尝试更宽松的查找：所有有默认网关的适配器
+                if (result.Count == 0)
+                {
+                    output = RunProcessWithOutput("powershell",
+                        "-Command \"" +
+                        "Get-NetIPConfiguration -ErrorAction SilentlyContinue | " +
+                        "  Where-Object {$_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq 'Up'} | " +
+                        "  ForEach-Object { " +
+                        "    Write-Output \\\"$($_.InterfaceAlias)|$($_.NetAdapter.InterfaceDescription)\\\" " +
+                        "  }\"", 15000);
+
+                    if (!string.IsNullOrWhiteSpace(output))
+                    {
+                        foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            var trimmed = line.Trim();
+                            if (string.IsNullOrEmpty(trimmed)) continue;
+
+                            var parts = trimmed.Split('|', 2);
+                            if (parts.Length >= 1 && !string.IsNullOrWhiteSpace(parts[0]))
+                            {
+                                var name = parts[0].Trim();
+                                var desc = parts.Length >= 2 ? parts[1].Trim() : name;
+                                // 排除 Wi-Fi Direct 虚拟适配器
+                                if (!name.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    result.Add((name, desc));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Logger.Info($"找到 {result.Count} 个可用互联网适配器: {string.Join(", ", result.Select(a => a.name))}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning($"获取可用互联网适配器列表失败: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        /// <summary>
         /// 获取当前有互联网连接的适配器名称
+        /// 核心原则：只返回确实有互联网访问能力的适配器，绝不猜测
         /// </summary>
         private string? GetInternetAdapterName()
         {
             try
             {
-                // 方法1：通过NetworkInformation获取互联网连接配置文件
+                // ====== 方法1（主）：通过 NetworkInformation API 获取真正的 Internet 连接 ======
+                // 这是 Windows 最可靠的 API，返回实际有互联网访问的连接配置文件
                 var profile = NetworkInformation.GetInternetConnectionProfile();
                 if (profile != null)
                 {
                     var adapterId = profile.NetworkAdapter?.NetworkAdapterId.ToString();
                     if (adapterId != null)
                     {
+                        // 通过 InterfaceGuid 精确查找对应的适配器名称
                         var output = RunProcessWithOutput("powershell",
-                            $"-Command \"(Get-NetAdapter | Where-Object {{$_.InterfaceGuid -eq '{adapterId}'}}).Name\"");
+                            $"-Command \"(Get-NetAdapter | Where-Object {{$_.InterfaceGuid -eq '{adapterId}'}} | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue)\"");
                         if (!string.IsNullOrWhiteSpace(output?.Trim()))
                         {
                             var name = output.Trim();
-                            // 排除Wi-Fi Direct虚拟适配器（不能把热点适配器当成上行）
-                            if (!name.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) &&
-                                !name.Contains("Local Area Connection", StringComparison.OrdinalIgnoreCase))
+                            // 只排除 Wi-Fi Direct 虚拟适配器
+                            if (!name.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase))
                             {
-                                Logger.Info($"通过InternetConnectionProfile找到互联网适配器: {name}");
+                                Logger.Info($"通过 InternetConnectionProfile 找到互联网适配器: {name}");
                                 return name;
                             }
-                            Logger.Info($"跳过Wi-Fi Direct虚拟适配器: {name}");
+                            Logger.Info($"跳过 Wi-Fi Direct 虚拟适配器: {name}");
+                        }
+                        else
+                        {
+                            Logger.Warning($"InternetConnectionProfile 提供了 AdapterId={adapterId}，但 Get-NetAdapter 未找到对应适配器");
+                        }
+                    }
+                    else
+                    {
+                        Logger.Warning("InternetConnectionProfile 的 NetworkAdapter 为 null");
+                    }
+                }
+                else
+                {
+                    Logger.Info("无活动的 Internet 连接配置文件");
+                }
+
+                // ====== 方法2：通过默认网关路由查找 ======
+                // 0.0.0.0/0 路由指向的接口就是互联网出口
+                Logger.Info("方法1失败，尝试通过默认网关路由查找互联网适配器");
+                var gwOutput = RunProcessWithOutput("powershell",
+                    "-Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias\"");
+                if (!string.IsNullOrWhiteSpace(gwOutput?.Trim()))
+                {
+                    var name = gwOutput.Trim();
+                    if (!name.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // 验证该适配器确实有 IPv4 地址和默认网关
+                        var validOutput = RunProcessWithOutput("powershell",
+                            $"-Command \"(Get-NetIPConfiguration -InterfaceAlias '{name.Replace("'", "''")}' -ErrorAction SilentlyContinue | Where-Object {{$_.IPv4DefaultGateway -ne $null}}).InterfaceAlias\"");
+                        if (!string.IsNullOrWhiteSpace(validOutput?.Trim()))
+                        {
+                            Logger.Info($"通过默认网关找到互联网适配器并验证通过: {name}");
+                            return name;
+                        }
+                        else
+                        {
+                            Logger.Warning($"默认网关接口 {name} 没有 IPv4 默认网关，跳过");
                         }
                     }
                 }
 
-                // 方法2：通过PowerShell直接查找有默认网关且状态为Up的适配器
-                Logger.Info("方法1失败，尝试通过默认网关查找互联网适配器");
-                var gwOutput = RunProcessWithOutput("powershell",
-                    "-Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1 | Get-NetAdapter).Name\"");
-                if (!string.IsNullOrWhiteSpace(gwOutput?.Trim()))
+                // ====== 方法3：枚举所有有 IPv4 默认网关的物理适配器 ======
+                // 优先选择以太网（有线），因为 Windows 在有线+无线同时存在时可能有路由优先级问题
+                Logger.Info("方法2失败，尝试枚举有默认网关的物理适配器（优先以太网）");
+                var ipConfigOutput = RunProcessWithOutput("powershell",
+                    "-Command \"" +
+                    "$adapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | " +
+                    "  Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*Wi-Fi Direct*'} | " +
+                    "  Where-Object { $_ | Get-NetIPConfiguration -ErrorAction SilentlyContinue | " +
+                    "    Where-Object {$_.IPv4DefaultGateway -ne $null} }; " +
+                    "# 优先返回以太网类型的有线网卡 " +
+                    "$eth = $adapters | Where-Object { $_.InterfaceDescription -notlike '*Wi-Fi*' -and $_.InterfaceDescription -notlike '*Wireless*' } | Select-Object -First 1; " +
+                    "if ($eth) { Write-Output $eth.Name; exit 0 }; " +
+                    "# 如果没有以太网，才返回第一个符合条件的 " +
+                    "$first = $adapters | Select-Object -First 1; " +
+                    "if ($first) { Write-Output $first.Name } \"", 15000);
+                if (!string.IsNullOrWhiteSpace(ipConfigOutput?.Trim()))
                 {
-                    var name = gwOutput.Trim();
-                    if (!name.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) &&
-                        !name.Contains("Local Area Connection", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Logger.Info($"通过默认网关找到互联网适配器: {name}");
-                        return name;
-                    }
+                    var name = ipConfigOutput.Trim();
+                    Logger.Info($"通过物理网卡+默认网关找到互联网适配器: {name}");
+                    return name;
                 }
 
-                // 方法3：查找状态为Up的非虚拟适配器
-                Logger.Info("方法2失败，尝试查找状态为Up的非虚拟适配器");
-                var upOutput = RunProcessWithOutput("powershell",
-                    "-Command \"(Get-NetAdapter | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notlike '*Wi-Fi Direct*' -and $_.InterfaceDescription -notlike '*Virtual*' -and $_.Name -notlike 'Local Area Connection*'} | Select-Object -First 1).Name\"");
-                if (!string.IsNullOrWhiteSpace(upOutput?.Trim()))
+                // ====== 方法4：日志诊断（列出所有 Up 适配器）======
+                Logger.Warning("所有方法均未找到互联网适配器，记录诊断信息");
+                var allUpOutput = RunProcessWithOutput("powershell",
+                    "-Command \"Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | " +
+                    "Select-Object Name, InterfaceDescription, MediaConnectionState, Status, LinkSpeed | " +
+                    "Format-Table -AutoSize | Out-String -Width 4096\"");
+                if (!string.IsNullOrWhiteSpace(allUpOutput?.Trim()))
                 {
-                    Logger.Info($"通过状态查找找到互联网适配器: {upOutput.Trim()}");
-                    return upOutput.Trim();
+                    Logger.Info($"所有状态为 Up 的适配器:\n{allUpOutput.Trim()}");
+                }
+
+                // 额外诊断：列出所有有默认网关的接口
+                var routeOutput = RunProcessWithOutput("powershell",
+                    "-Command \"Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | " +
+                    "Select-Object InterfaceAlias, RouteMetric, NextHop | Format-Table -AutoSize | Out-String -Width 4096\"");
+                if (!string.IsNullOrWhiteSpace(routeOutput?.Trim()))
+                {
+                    Logger.Info($"所有默认路由:\n{routeOutput.Trim()}");
                 }
             }
             catch (Exception ex)
@@ -1299,7 +1505,7 @@ namespace AdvancedWindowsHotspot.Services
             return null;
         }
 
-        private void DisableInternetSharing()
+        public void DisableInternetSharing()
         {
             try
             {

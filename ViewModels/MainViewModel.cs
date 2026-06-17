@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -90,6 +91,8 @@ namespace AdvancedWindowsHotspot.ViewModels
                 {
                     DeferSaveSettings();
                     OnPropertyChanged(nameof(ShowEnableSharingButton));
+                    OnPropertyChanged(nameof(ShowSharingSection));
+                    OnAllowInternetChanged();
                 }
             }
         }
@@ -123,6 +126,7 @@ namespace AdvancedWindowsHotspot.ViewModels
                     OnPropertyChanged(nameof(StatusText));
                     OnPropertyChanged(nameof(ActionButtonText));
                     OnPropertyChanged(nameof(ShowEnableSharingButton));
+                    OnPropertyChanged(nameof(ShowSharingSection));
                     RaiseCanExecuteChanged();
                 }
             }
@@ -219,6 +223,32 @@ namespace AdvancedWindowsHotspot.ViewModels
         /// </summary>
         public bool ShowEnableSharingButton => IsRunning && !UseSystemHotspot && AllowInternet;
 
+        /// <summary>
+        /// 是否显示共享适配器选择区域（允许联网 + 热点运行中）
+        /// </summary>
+        public bool ShowSharingSection => AllowInternet && IsRunning;
+
+        /// <summary>
+        /// 可用的互联网适配器列表
+        /// </summary>
+        public ObservableCollection<NetworkAdapterItem> InternetAdapters { get; } = new();
+
+        private NetworkAdapterItem? _selectedInternetAdapter;
+        /// <summary>
+        /// 用户选中的互联网适配器
+        /// </summary>
+        public NetworkAdapterItem? SelectedInternetAdapter
+        {
+            get => _selectedInternetAdapter;
+            set
+            {
+                if (SetProperty(ref _selectedInternetAdapter, value))
+                {
+                    DeferSaveSettings();
+                }
+            }
+        }
+
         #endregion
 
         #region 命令
@@ -294,6 +324,7 @@ namespace AdvancedWindowsHotspot.ViewModels
             {
                 Status = HotspotStatus.Starting;
                 ErrorMessage = string.Empty;
+                IcsResultMessage = string.Empty;
                 Logger.Info($"用户请求启动热点: SSID={Ssid}");
 
                 var settings = new HotspotSettings
@@ -307,6 +338,10 @@ namespace AdvancedWindowsHotspot.ViewModels
 
                 await _hotspotService.StartAsync(settings);
                 Status = HotspotStatus.Running;
+
+                // 热点启动后刷新互联网适配器列表
+                RefreshInternetAdapters();
+
                 Logger.Info("热点启动成功");
             }
             catch (NotSupportedException ex)
@@ -337,6 +372,7 @@ namespace AdvancedWindowsHotspot.ViewModels
             try
             {
                 Status = HotspotStatus.Stopping;
+                IcsResultMessage = string.Empty;
                 Logger.Info("用户请求停止热点");
 
                 await _hotspotService.StopAsync();
@@ -366,11 +402,13 @@ namespace AdvancedWindowsHotspot.ViewModels
             if (IsConfiguringIcs) return;
 
             IsConfiguringIcs = true;
+            IcsResultMessage = string.Empty;
             IcsResultMessage = "正在配置网络共享...";
 
             try
             {
-                var result = await Task.Run(() => _hotspotService.ManualEnableInternetSharing());
+                var selectedAdapter = SelectedInternetAdapter?.Name;
+                var result = await Task.Run(() => _hotspotService.ManualEnableInternetSharing(selectedAdapter));
                 IcsResultSuccess = result.success;
                 IcsResultMessage = result.message;
             }
@@ -388,6 +426,62 @@ namespace AdvancedWindowsHotspot.ViewModels
         private void RaiseCanExecuteChanged()
         {
             CommandManager.InvalidateRequerySuggested();
+        }
+
+        /// <summary>
+        /// 刷新可用的互联网适配器列表
+        /// </summary>
+        private void RefreshInternetAdapters()
+        {
+            InternetAdapters.Clear();
+            SelectedInternetAdapter = null;
+
+            try
+            {
+                var adapters = _hotspotService.GetAvailableInternetAdapters();
+                foreach (var (name, description) in adapters)
+                {
+                    InternetAdapters.Add(new NetworkAdapterItem(name, description));
+                }
+
+                // 自动选择第一个适配器
+                if (InternetAdapters.Count > 0)
+                {
+                    SelectedInternetAdapter = InternetAdapters[0];
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"刷新互联网适配器列表失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// 运行中切换"允许联网"开关时，动态启用/禁用ICS
+        /// </summary>
+        private async void OnAllowInternetChanged()
+        {
+            if (!IsRunning) return;
+
+            try
+            {
+                if (!AllowInternet)
+                {
+                    // 关闭联网 → 禁用ICS
+                    IcsResultMessage = string.Empty;
+                    await Task.Run(() => _hotspotService.DisableInternetSharing());
+                    Logger.Info("已禁用网络共享（用户关闭允许联网开关）");
+                }
+                else
+                {
+                    // 开启联网 → 刷新适配器列表
+                    RefreshInternetAdapters();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"切换允许联网状态失败: {ex.Message}");
+            }
         }
 
         #region 设置持久化
@@ -484,5 +578,27 @@ namespace AdvancedWindowsHotspot.ViewModels
         }
 
         #endregion
+    }
+
+    /// <summary>
+    /// 网络适配器选项（用于下拉选择）
+    /// </summary>
+    public class NetworkAdapterItem
+    {
+        public string Name { get; }
+        public string Description { get; }
+
+        public NetworkAdapterItem(string name, string description)
+        {
+            Name = name;
+            Description = description;
+        }
+
+        /// <summary>
+        /// 显示文本：适配器名称 (描述)
+        /// </summary>
+        public string DisplayName => Description == Name ? Name : $"{Name} ({Description})";
+
+        public override string ToString() => DisplayName;
     }
 }

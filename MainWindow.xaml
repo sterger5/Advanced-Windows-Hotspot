@@ -5,6 +5,7 @@
         xmlns:converters="clr-namespace:AdvancedWindowsHotspot.Converters"
         xmlns:models="clr-namespace:AdvancedWindowsHotspot.Models"
         Title="Advanced Windows Hotspot"
+        Icon="pack://application:,,,/app.ico"
         ResizeMode="CanResizeWithGrip"
         Width="560" Height="700"
         MinWidth="480" MinHeight="600"
@@ -209,17 +210,31 @@
                         </CheckBox>
                     </Border>
 
-                    <!-- 手动启用网络共享按钮（仅WiFiDirect模式+热点运行中显示） -->
+                    <!-- 网络共享区域（允许联网 + 热点运行中显示） -->
                     <Border CornerRadius="12" Background="{StaticResource SurfaceContainerLowBrush}" Padding="16,12" Margin="0,0,0,8"
-                            Visibility="{Binding ShowEnableSharingButton, Converter={StaticResource BoolToVisibilityConverter}}">
+                            Visibility="{Binding ShowSharingSection, Converter={StaticResource BoolToVisibilityConverter}}">
                         <StackPanel>
                             <TextBlock Text="网络共享" FontSize="14" FontWeight="Medium"
                                        Foreground="{StaticResource OnSurfaceBrush}" Margin="0,0,0,4"/>
+                            <!-- 适配器选择 -->
+                            <TextBlock Text="共享来源（上行网卡）" FontSize="12"
+                                       Foreground="{StaticResource OnSurfaceVariantBrush}" Margin="0,0,0,4"/>
+                            <ComboBox ItemsSource="{Binding InternetAdapters}"
+                                      SelectedItem="{Binding SelectedInternetAdapter}"
+                                      DisplayMemberPath="DisplayName"
+                                      Style="{StaticResource MaterialComboBox}"
+                                      ItemContainerStyle="{StaticResource MaterialComboBoxItem}"
+                                      Margin="0,0,0,8"
+                                      IsEnabled="{Binding IsConfiguringIcs, Converter={StaticResource InverseBoolConverter}}"/>
+                            <!-- WiFiDirect模式提示 -->
                             <TextBlock Text="WiFiDirect模式需手动启用网络共享，设备才能访问互联网" FontSize="12"
-                                       Foreground="{StaticResource OnSurfaceVariantBrush}" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                                       Foreground="{StaticResource OnSurfaceVariantBrush}" TextWrapping="Wrap" Margin="0,0,0,8"
+                                       Visibility="{Binding ShowEnableSharingButton, Converter={StaticResource BoolToVisibilityConverter}}"/>
+                            <!-- 启用共享按钮（仅WiFiDirect模式显示） -->
                             <Button Command="{Binding EnableSharingCommand}"
                                     HorizontalAlignment="Stretch" Height="36"
-                                    Cursor="Hand">
+                                    Cursor="Hand"
+                                    Visibility="{Binding ShowEnableSharingButton, Converter={StaticResource BoolToVisibilityConverter}}">
                                 <Button.Style>
                                     <Style TargetType="Button">
                                         <Setter Property="Background" Value="{StaticResource PrimaryBrush}"/>
